@@ -119,6 +119,10 @@ from pyiceberg.io import (
     OutputStream,
     _parse_location,
 )
+from pyiceberg.io.equality_deletes import (
+    EqualityDeleteFilter,
+    split_delete_files,
+)
 from pyiceberg.manifest import (
     DataFile,
     DataFileContent,
@@ -1362,6 +1366,8 @@ def _task_to_record_batches(
     name_mapping: Optional[NameMapping] = None,
     use_large_types: bool = True,
     partition_spec: Optional[PartitionSpec] = None,
+    equality_delete_filter: Optional[EqualityDeleteFilter] = None,
+    prepared_equality_deletes: Optional[List[Any]] = None,
 ) -> Iterator[pa.RecordBatch]:
     _, _, path = _parse_location(task.file.file_path)
     arrow_format = ds.ParquetFileFormat(pre_buffer=True, buffer_size=(ONE_MEGABYTE * 8))
@@ -1380,13 +1386,23 @@ def _task_to_record_batches(
             bound_file_filter = bind(file_schema, translated_row_filter, case_sensitive=case_sensitive)
             pyarrow_filter = expression_to_pyarrow(bound_file_filter)
 
+        # Equality delete key columns have to be read from the data file even
+        # when the caller did not project them.  They are dropped again when
+        # the requested output schema is applied at the end of the batch.
+        equality_key_ids: Set[int] = set()
+        if prepared_equality_deletes:
+            for prepared in prepared_equality_deletes:
+                equality_key_ids.update(prepared.equality_ids)
+
+        read_field_ids = projected_field_ids.union(equality_key_ids)
+
         # Apply column projection rules
         # https://iceberg.apache.org/spec/#column-projection
         should_project_columns, projected_missing_fields = _get_column_projection_values(
             task.file, projected_schema, partition_spec, file_schema.field_ids
         )
 
-        file_project_schema = prune_columns(file_schema, projected_field_ids, select_full_types=False)
+        file_project_schema = prune_columns(file_schema, read_field_ids, select_full_types=False)
 
         fragment_scanner = ds.Scanner.from_fragment(
             fragment=fragment,
@@ -1414,6 +1430,20 @@ def _task_to_record_batches(
                 # Create the mask of indices that we're interested in
                 indices = _combine_positional_deletes(positional_deletes, current_index, current_index + len(batch))
                 current_batch = current_batch.take(indices)
+
+            # Equality deletes are applied after positional deletes.  The
+            # positions in a positional delete file point at the physical row
+            # numbers of the original data file, which is exactly the order in
+            # which the batches arrive here; applying them first keeps those
+            # positions valid.
+            if prepared_equality_deletes and equality_delete_filter is not None:
+                if current_batch.num_rows > 0:
+                    survival_mask = equality_delete_filter.mask_for_batch(
+                        batch=current_batch,
+                        data_file_path=task.file.file_path,
+                        prepared_deletes=prepared_equality_deletes,
+                    )
+                    current_batch = current_batch.filter(survival_mask)
 
             # skip empty batches
             if current_batch.num_rows == 0:
@@ -1451,7 +1481,15 @@ def _task_to_record_batches(
 
 def _read_all_delete_files(io: FileIO, tasks: Iterable[FileScanTask]) -> Dict[str, List[ChunkedArray]]:
     deletes_per_file: Dict[str, List[ChunkedArray]] = {}
-    unique_deletes = set(itertools.chain.from_iterable([task.delete_files for task in tasks]))
+    # Equality delete files have a different physical layout (no file_path/pos
+    # columns) and are handled separately by the EqualityDeleteFilter, so only
+    # positional deletes are materialized here.
+    unique_deletes = set(
+        itertools.chain.from_iterable(
+            [delete_file for delete_file in task.delete_files if delete_file.content == DataFileContent.POSITION_DELETES]
+            for task in tasks
+        )
+    )
     if len(unique_deletes) > 0:
         executor = ExecutorFactory.get_or_create()
         deletes_per_files: Iterator[Dict[str, ChunkedArray]] = executor.map(
@@ -1555,50 +1593,57 @@ class ArrowScan:
             ResolveError: When a required field cannot be found in the file
             ValueError: When a field type in the file cannot be projected to the schema type
         """
+        # Materialize the tasks once so the same delete file is never planned
+        # twice and the equality delete filter can cache it for every task.
+        tasks = list(tasks)
         deletes_per_file = _read_all_delete_files(self._io, tasks)
-        executor = ExecutorFactory.get_or_create()
+        equality_delete_filter = EqualityDeleteFilter(self._table_metadata, self._io)
+        try:
+            executor = ExecutorFactory.get_or_create()
 
-        def _table_from_scan_task(task: FileScanTask) -> pa.Table:
-            batches = list(self._record_batches_from_scan_tasks_and_deletes([task], deletes_per_file))
-            if len(batches) > 0:
-                return pa.Table.from_batches(batches)
-            else:
-                return None
+            def _table_from_scan_task(task: FileScanTask) -> pa.Table:
+                batches = list(self._record_batches_from_scan_tasks_and_deletes([task], deletes_per_file, equality_delete_filter))
+                if len(batches) > 0:
+                    return pa.Table.from_batches(batches)
+                else:
+                    return None
 
-        futures = [
-            executor.submit(
-                _table_from_scan_task,
-                task,
-            )
-            for task in tasks
-        ]
-        total_row_count = 0
-        # for consistent ordering, we need to maintain future order
-        futures_index = {f: i for i, f in enumerate(futures)}
-        completed_futures: SortedList[Future[pa.Table]] = SortedList(iterable=[], key=lambda f: futures_index[f])
-        for future in concurrent.futures.as_completed(futures):
-            completed_futures.add(future)
-            if table_result := future.result():
-                total_row_count += len(table_result)
-            # stop early if limit is satisfied
-            if self._limit is not None and total_row_count >= self._limit:
-                break
+            futures = [
+                executor.submit(
+                    _table_from_scan_task,
+                    task,
+                )
+                for task in tasks
+            ]
+            total_row_count = 0
+            # for consistent ordering, we need to maintain future order
+            futures_index = {f: i for i, f in enumerate(futures)}
+            completed_futures: SortedList[Future[pa.Table]] = SortedList(iterable=[], key=lambda f: futures_index[f])
+            for future in concurrent.futures.as_completed(futures):
+                completed_futures.add(future)
+                if table_result := future.result():
+                    total_row_count += len(table_result)
+                # stop early if limit is satisfied
+                if self._limit is not None and total_row_count >= self._limit:
+                    break
 
-        # by now, we've either completed all tasks or satisfied the limit
-        if self._limit is not None:
-            _ = [f.cancel() for f in futures if not f.done()]
+            # by now, we've either completed all tasks or satisfied the limit
+            if self._limit is not None:
+                _ = [f.cancel() for f in futures if not f.done()]
 
-        tables = [f.result() for f in completed_futures if f.result()]
+            tables = [f.result() for f in completed_futures if f.result()]
 
-        if len(tables) < 1:
-            return pa.Table.from_batches([], schema=schema_to_pyarrow(self._projected_schema, include_field_ids=False))
+            if len(tables) < 1:
+                return pa.Table.from_batches([], schema=schema_to_pyarrow(self._projected_schema, include_field_ids=False))
 
-        result = pa.concat_tables(tables, promote_options="permissive")
+            result = pa.concat_tables(tables, promote_options="permissive")
 
-        if self._limit is not None:
-            return result.slice(0, self._limit)
+            if self._limit is not None:
+                return result.slice(0, self._limit)
 
-        return result
+            return result
+        finally:
+            equality_delete_filter.close()
 
     def to_record_batches(self, tasks: Iterable[FileScanTask]) -> Iterator[pa.RecordBatch]:
         """Scan the Iceberg table and return an Iterator[pa.RecordBatch].
@@ -1618,36 +1663,59 @@ class ArrowScan:
             ResolveError: When a required field cannot be found in the file
             ValueError: When a field type in the file cannot be projected to the schema type
         """
+        tasks = list(tasks)
         deletes_per_file = _read_all_delete_files(self._io, tasks)
-        return self._record_batches_from_scan_tasks_and_deletes(tasks, deletes_per_file)
+        equality_delete_filter = EqualityDeleteFilter(self._table_metadata, self._io)
+        try:
+            yield from self._record_batches_from_scan_tasks_and_deletes(tasks, deletes_per_file, equality_delete_filter)
+        finally:
+            # Also releases the cached keys when the caller stops iterating
+            # early (for example by closing the RecordBatchReader).
+            equality_delete_filter.close()
 
     def _record_batches_from_scan_tasks_and_deletes(
-        self, tasks: Iterable[FileScanTask], deletes_per_file: Dict[str, List[ChunkedArray]]
+        self,
+        tasks: Iterable[FileScanTask],
+        deletes_per_file: Dict[str, List[ChunkedArray]],
+        equality_delete_filter: Optional[EqualityDeleteFilter] = None,
     ) -> Iterator[pa.RecordBatch]:
+        if equality_delete_filter is None:
+            equality_delete_filter = EqualityDeleteFilter(self._table_metadata, self._io)
+            owns_filter = True
+        else:
+            owns_filter = False
         total_row_count = 0
-        for task in tasks:
-            if self._limit is not None and total_row_count >= self._limit:
-                break
-            batches = _task_to_record_batches(
-                _fs_from_file_path(self._io, task.file.file_path),
-                task,
-                self._bound_row_filter,
-                self._projected_schema,
-                self._projected_field_ids,
-                deletes_per_file.get(task.file.file_path),
-                self._case_sensitive,
-                self._table_metadata.name_mapping(),
-                self._use_large_types,
-                self._table_metadata.spec(),
-            )
-            for batch in batches:
-                if self._limit is not None:
-                    if total_row_count >= self._limit:
-                        break
-                    elif total_row_count + len(batch) >= self._limit:
-                        batch = batch.slice(0, self._limit - total_row_count)
-                yield batch
-                total_row_count += len(batch)
+        try:
+            for task in tasks:
+                if self._limit is not None and total_row_count >= self._limit:
+                    break
+                _, equality_delete_files = split_delete_files(task.delete_files)
+                prepared_equality_deletes = equality_delete_filter.prepare(equality_delete_files) if equality_delete_files else []
+                batches = _task_to_record_batches(
+                    _fs_from_file_path(self._io, task.file.file_path),
+                    task,
+                    self._bound_row_filter,
+                    self._projected_schema,
+                    self._projected_field_ids,
+                    deletes_per_file.get(task.file.file_path),
+                    self._case_sensitive,
+                    self._table_metadata.name_mapping(),
+                    self._use_large_types,
+                    self._table_metadata.spec(),
+                    equality_delete_filter,
+                    prepared_equality_deletes,
+                )
+                for batch in batches:
+                    if self._limit is not None:
+                        if total_row_count >= self._limit:
+                            break
+                        elif total_row_count + len(batch) >= self._limit:
+                            batch = batch.slice(0, self._limit - total_row_count)
+                    yield batch
+                    total_row_count += len(batch)
+        finally:
+            if owns_filter:
+                equality_delete_filter.close()
 
 
 def _to_requested_schema(

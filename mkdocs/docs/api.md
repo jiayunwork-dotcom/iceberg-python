@@ -1394,6 +1394,32 @@ The low level API `plan_files` methods returns a set of tasks that provide the f
 
 In this case it is up to the engine itself to filter the file itself. Below, `to_arrow()` and `to_duckdb()` that already do this for you.
 
+### Equality deletes (format v2)
+
+Iceberg format-version 2 tables can carry **equality delete files**. An equality delete file is a Parquet file whose `equality_ids` identify one or more columns; every data row whose values on those columns matches a row of the delete file is removed, no matter which data file it lives in.
+
+PyIceberg applies equality deletes transparently, so no rewriting of the table into plain Parquet is required:
+
+```python
+# All three read paths return the surviving rows with deletes already applied
+table.scan().to_arrow()
+table.scan().to_arrow_batch_reader()
+table.scan().count()  # without a limit
+```
+
+How matching works follows the [Iceberg specification](https://iceberg.apache.org/spec/):
+
+- An equality delete only removes rows of data files whose **data sequence number is strictly smaller** than the delete file's sequence number. Rows written in the same sequence as the delete are kept. Sequence numbers omitted from a manifest entry are inherited from the manifest list rather than taken from the file sequence number or file ordering.
+- A delete written against a **partitioned spec** only applies to data files with the same spec id and the same partition values. A delete written with the **unpartitioned (empty) spec** applies to every older data file, regardless of the data file's spec.
+- Every column in the delete file's own `equality_ids` has to match (composite keys are conjunctive). `null` matches `null`, duplicate keys delete only once, repeated data rows are all removed, and extra, non-key columns in the delete file are ignored.
+- Columns are identified by **field id**, so renames, reordering or a different column with the same name do not confuse matching. Columns added after an older data file was written are projected as `null`. The legal `int -> long` and decimal precision promotions are handled without losing integer precision or converting decimals to floats.
+- Equality deletes can be combined with position deletes in the same snapshot. Positions still refer to the physical row numbers of the original data file.
+- Each snapshot is read independently: `table.scan(snapshot_id=...)` only sees deletes that were present in that snapshot.
+
+Supported equality key types are `boolean`, `int`, `long`, `string`, `decimal`, `date`, `time`, `timestamp` and `timestamptz`, either at the top level or as leaves of an optional `struct`. When the parent struct is `null`, its leaves compare as `null`. Keys inside `list` or `map` types, and key types outside the list above, are rejected with an explicit error identifying the delete file or field id. A delete file that is unreadable, has missing/empty/duplicate/unknown `equality_ids`, or cannot be interpreted against the table's schema history fails the scan instead of being skipped.
+
+Delete keys are loaded once per scan (a shared delete file is never re-read for every data file) and de-duplicated in memory, while data files continue to be streamed one batch at a time. Row filters, column projections and limits are applied on top of the surviving rows, so deleted rows can never reappear and a limit is filled from rows that actually survive.
+
 ### Apache Arrow
 
 <!-- prettier-ignore-start -->

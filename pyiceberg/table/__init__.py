@@ -1577,29 +1577,98 @@ def _min_sequence_number(manifests: List[ManifestFile]) -> int:
         return INITIAL_SEQUENCE_NUMBER
 
 
-def _match_deletes_to_data_file(data_entry: ManifestEntry, positional_delete_entries: SortedList[ManifestEntry]) -> Set[DataFile]:
-    """Check if the delete file is relevant for the data file.
+def _match_deletes_to_data_file(
+    data_entry: ManifestEntry,
+    positional_delete_entries: SortedList[ManifestEntry],
+    equality_delete_entries: Optional[List[ManifestEntry]] = None,
+    specs: Optional[Dict[int, "PartitionSpec"]] = None,
+) -> Set[DataFile]:
+    """Check which delete files are relevant for the data file.
 
-    Using the column metrics to see if the filename is in the lower and upper bound.
+    Positional delete files are matched with the column metrics (the file
+    path has to be inside their lower/upper bounds).  Equality delete files
+    are matched following the Iceberg v2 rules:
+
+    - an equality delete only applies to data files whose data sequence
+      number is strictly smaller than the delete's sequence number.  Data
+      written in the same sequence stays;
+    - a partition-scoped delete requires the same partition spec id and the
+      same partition values as the data file;
+    - a delete written against the unpartitioned (empty field) spec applies
+      to every older data file, regardless of the data file's spec.
+
+    Sequence numbers are the inherited manifest entry sequence numbers, so
+    values legally omitted from the manifest are already resolved here.
 
     Args:
-        data_entry (ManifestEntry): The manifest entry path of the datafile.
-        positional_delete_entries (List[ManifestEntry]): All the candidate positional deletes manifest entries.
+        data_entry (ManifestEntry): The manifest entry of the data file.
+        positional_delete_entries (List[ManifestEntry]): All the candidate
+            positional deletes manifest entries.
+        equality_delete_entries (List[ManifestEntry]): All the candidate
+            equality deletes manifest entries.
+        specs (Dict[int, PartitionSpec]): The partition specs of the table,
+            keyed by spec id.
 
     Returns:
-        A set of files that are relevant for the data file.
+        A set of delete files that are relevant for the data file.
     """
     relevant_entries = positional_delete_entries[positional_delete_entries.bisect_right(data_entry) :]
 
+    relevant_delete_files: Set[DataFile] = set()
     if len(relevant_entries) > 0:
         evaluator = _InclusiveMetricsEvaluator(POSITIONAL_DELETE_SCHEMA, EqualTo("file_path", data_entry.data_file.file_path))
-        return {
+        relevant_delete_files = {
             positional_delete_entry.data_file
             for positional_delete_entry in relevant_entries
             if evaluator.eval(positional_delete_entry.data_file)
         }
-    else:
-        return set()
+
+    if equality_delete_entries:
+        data_sequence_number = data_entry.sequence_number or INITIAL_SEQUENCE_NUMBER
+        data_file = data_entry.data_file
+        for delete_entry in equality_delete_entries:
+            delete_file = delete_entry.data_file
+            delete_sequence_number = delete_entry.sequence_number or INITIAL_SEQUENCE_NUMBER
+            # Equality deletes never affect rows written in the same or a
+            # later sequence number.
+            if delete_sequence_number <= data_sequence_number:
+                continue
+
+            if _equality_delete_matches_partition(delete_file, data_file, specs):
+                relevant_delete_files.add(delete_file)
+
+    return relevant_delete_files
+
+
+def _equality_delete_matches_partition(
+    delete_file: DataFile,
+    data_file: DataFile,
+    specs: Optional[Dict[int, "PartitionSpec"]],
+) -> bool:
+    """Apply the partition scoping rules for an equality delete file."""
+    delete_spec = specs.get(delete_file.spec_id) if specs else None
+    # A delete written with the unpartitioned spec has no partition fields and
+    # therefore applies globally to all older data files.
+    if delete_spec is not None and delete_spec.is_unpartitioned():
+        return True
+
+    if delete_file.spec_id != data_file.spec_id:
+        return False
+
+    if delete_spec is None:
+        # The spec is not retained in the table metadata; only the empty spec
+        # can be treated as global, and a non-empty spec cannot be compared
+        # without its definition, so fail rather than guessing with the
+        # current default spec.
+        raise ValueError(
+            f"Equality delete file {delete_file.file_path} references unknown partition spec id {delete_file.spec_id}"
+        )
+
+    # Same spec id means both partition records are structured by the same
+    # spec, so positional/value equality is the correct comparison.
+    if len(delete_file.partition) != len(data_file.partition):
+        return False
+    return all(delete_file.partition[index] == data_file.partition[index] for index in range(len(delete_file.partition)))
 
 
 class DataScan(TableScan):
@@ -1707,6 +1776,7 @@ class DataScan(TableScan):
 
         data_entries: List[ManifestEntry] = []
         positional_delete_entries = SortedList(key=lambda entry: entry.sequence_number or INITIAL_SEQUENCE_NUMBER)
+        equality_delete_entries: List[ManifestEntry] = []
 
         executor = ExecutorFactory.get_or_create()
         for manifest_entry in chain(
@@ -1730,16 +1800,20 @@ class DataScan(TableScan):
             elif data_file.content == DataFileContent.POSITION_DELETES:
                 positional_delete_entries.add(manifest_entry)
             elif data_file.content == DataFileContent.EQUALITY_DELETES:
-                raise ValueError("PyIceberg does not yet support equality deletes: https://github.com/apache/iceberg/issues/6568")
+                self._validate_equality_delete_entry(manifest_entry)
+                equality_delete_entries.append(manifest_entry)
             else:
                 raise ValueError(f"Unknown DataFileContent ({data_file.content}): {manifest_entry}")
 
+        specs = self.table_metadata.specs()
         return [
             FileScanTask(
                 data_entry.data_file,
                 delete_files=_match_deletes_to_data_file(
                     data_entry,
                     positional_delete_entries,
+                    equality_delete_entries,
+                    specs,
                 ),
                 residual=residual_evaluators[data_entry.data_file.spec_id](data_entry.data_file).residual_for(
                     data_entry.data_file.partition
@@ -1747,6 +1821,36 @@ class DataScan(TableScan):
             )
             for data_entry in data_entries
         ]
+
+    def _validate_equality_delete_entry(self, manifest_entry: ManifestEntry) -> None:
+        """Validate the manifest-level properties of an equality delete file.
+
+        Physical and schema-level validation happens when the Parquet file is
+        opened on the read path, but malformed manifest metadata is rejected
+        here so that the failure message can identify the file directly.
+        """
+        data_file = manifest_entry.data_file
+        equality_ids = data_file.equality_ids
+        if equality_ids is None:
+            raise ValueError(f"Equality delete file {data_file.file_path} is missing the equality_ids property")
+        if len(equality_ids) == 0:
+            raise ValueError(f"Equality delete file {data_file.file_path} has an empty equality_ids list")
+        if len(set(equality_ids)) != len(equality_ids):
+            raise ValueError(f"Equality delete file {data_file.file_path} has duplicate equality_ids: {list(equality_ids)}")
+        for field_id in equality_ids:
+            if not any(self._field_id_in_schema(field_id, schema) for schema in self.table_metadata.schemas):
+                raise ValueError(
+                    f"Equality delete file {data_file.file_path} references unknown field id {field_id}; "
+                    "it is not present in the table schema or its schema history"
+                )
+
+    @staticmethod
+    def _field_id_in_schema(field_id: int, schema: Schema) -> bool:
+        try:
+            schema.find_field(field_id)
+            return True
+        except ValueError:
+            return False
 
     def to_arrow(self) -> pa.Table:
         """Read an Arrow table eagerly from this DataScan.
@@ -1835,15 +1939,17 @@ class DataScan(TableScan):
     def count(self) -> int:
         from pyiceberg.io.pyarrow import ArrowScan
 
-        # Usage: Calculates the total number of records in a Scan that haven't had positional deletes.
+        # Calculates the total number of surviving records in a scan.  Tasks
+        # without any deletes and with a fully satisfied residual can use the
+        # record count straight from the data file metadata; every other task
+        # (positional or equality deletes, residual filters) goes through the
+        # actual Arrow read path so that the count reflects the applied
+        # deletes.
         res = 0
         # every task is a FileScanTask
         tasks = self.plan_files()
 
         for task in tasks:
-            # task.residual is a Boolean Expression if the filter condition is fully satisfied by the
-            # partition value and task.delete_files represents that positional delete haven't been merged yet
-            # hence those files have to read as a pyarrow table applying the filter and deletes
             if task.residual == AlwaysTrue() and len(task.delete_files) == 0:
                 # Every File has a metadata stat that stores the file record count
                 res += task.file.record_count
