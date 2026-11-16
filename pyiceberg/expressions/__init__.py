@@ -247,6 +247,36 @@ class Reference(UnboundTerm[Any]):
         return BoundReference[L]
 
 
+class ColumnRef:
+    """A reference to another top-level field of the same row.
+
+    ``ColumnRef`` is not a boolean expression.  It is used as the right-hand
+    side of an update assignment (see :meth:`pyiceberg.table.Table.update_rows`)
+    to copy the value of another top-level field.  The referenced value is
+    always the value the row had *before* the update, which makes it possible
+    to swap two columns in a single operation.
+
+    Args:
+        name: The name of the source field.  Must be a non-empty string.
+    """
+
+    name: str
+
+    def __init__(self, name: str) -> None:
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"ColumnRef requires a non-empty field name string, got: {name!r}")
+        self.name = name
+
+    def __repr__(self) -> str:
+        return f"ColumnRef(name={self.name!r})"
+
+    def __eq__(self, other: Any) -> bool:
+        return self.name == other.name if isinstance(other, ColumnRef) else False
+
+    def __hash__(self) -> int:
+        return hash((ColumnRef, self.name))
+
+
 class And(BooleanExpression):
     """AND operation expression - logical conjunction."""
 

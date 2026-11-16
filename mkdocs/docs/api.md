@@ -539,6 +539,42 @@ assert upd.rows_inserted == 1
 
 PyIceberg will automatically detect which rows need to be updated, inserted or can simply be ignored.
 
+### Conditional row updates
+
+`update_rows` corrects the values of the rows that are currently alive in a table, without preparing a replacement data set and matching it by key. The assignments are applied in place: the row filter selects the rows, and every right-hand side and the filter are evaluated against the rows as they were *before* the update.
+
+```python
+from pyiceberg.expressions import ColumnRef, EqualTo
+
+# Set a constant on the matching rows.
+changed = tbl.update_rows({"inhabitants": 1000000}, row_filter=EqualTo("city", "Drachten"))
+
+# Copy the pre-update value of another top-level field. Note that a plain
+# string is always a string constant, never a column name.
+tbl.update_rows({"country": ColumnRef("city")}, row_filter="inhabitants > 1000000")
+
+# Swapping two columns in one call reads both old values first.
+tbl.update_rows({"a": ColumnRef("b"), "b": ColumnRef("a")})
+```
+
+The method returns the number of rows whose value actually changed. Duplicate rows each count once. An empty table, a filter that matches nothing, and matching rows that already hold the assigned values all return `0` and publish no snapshot. Otherwise a single OVERWRITE snapshot is published that both invalidates the rewritten files and adds their replacements; no intermediate snapshot is visible. When a `NULL`/`NULL`, `NaN`/`NaN`, or `+0.0`/`-0.0` comparison is made, the values are considered unchanged; everything else is compared exactly using the declared field type.
+
+The right-hand side is either a Python scalar that the field type accepts *exactly* (no truncation, rounding or clipping), `None` for an optional field, or a `pyiceberg.expressions.ColumnRef` that names another top-level field. `ColumnRef` requires the source and target types to be identical or connected by an Iceberg lossless promotion (`int` to `long`, `float` to `double`, or a decimal with the same scale and no larger precision). Field names are resolved with `case_sensitive`, and a case-folded name that matches more than one field is rejected.
+
+An empty mapping, an unknown field, a nested/list/map/struct target, assigning `None` to a required field, a value that the field type does not accept exactly, and a lossy `ColumnRef` promotion all raise `ValueError`; these are validated before any data file is opened, so they are reported even when the filter matches nothing. A `ColumnRef`-produced `NULL` for a required field can only be detected while reading rows and fails the whole operation.
+
+The table must use `format-version=2` and Parquet data files. Data files that the scan planning and their metadata prove cannot match are neither opened nor rewritten, and the data files that are not rewritten keep their paths. The rewritten rows are written with the current partition spec, so changing a partition source field moves the rows to the new partition; files written with an older spec and rows covered by equality or position deletes are handled by the existing read path, so deleted rows are never revived.
+
+`Table.update_rows` publishes one data snapshot. `Transaction.update_rows` stages the same change into an existing transaction instead, so earlier `append`, `update_schema` or `update_spec` calls form the state it operates on and later operations can build on its result. A failed `update_rows` leaves no partial state behind and aborts the transaction: further staging and `commit_transaction` raise `RuntimeError`. Two table instances that start from the same version conflict, and the second committer receives `CommitFailedException` rather than silently overwriting the first.
+
+#### Rewrite granularity
+
+The update rewrites whole data files, so its cost is copy-on-write:
+
+- **Read amplification** is low for files that cannot match: manifest partition summaries and per-column metrics prune them before they are opened. Every remaining file is read completely, including its non-matching rows, because those rows must be written back unchanged (with their duplicate counts) and because positional/equality deletes have to be applied before anything is written.
+- **Write amplification** is proportional to the size of the affected files, not to the number of changed rows. A handful of matches in a very large file rewrites that whole file, and changing a partition source field rewrites the surviving rows of the file into the current spec.
+- An alternative that keeps old files and writes position or equality delete files would reduce write amplification for tiny matches, but it adds delete-file read amplification to every subsequent scan, needs a new delete-file writer plus careful sequence-number handling, and is considerably harder to get right (in particular when the same rows would be updated again). Reusing the existing scan/deletes read path and OVERWRITE snapshot keeps the implementation small and makes already-deleted rows, old partition specs and schema evolution fall out of the existing read path.
+
 ## Inspecting tables
 
 To explore the table metadata, tables can be inspected.

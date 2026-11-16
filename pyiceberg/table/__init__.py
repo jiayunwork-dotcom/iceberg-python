@@ -247,6 +247,7 @@ class Transaction:
     _autocommit: bool
     _updates: Tuple[TableUpdate, ...]
     _requirements: Tuple[TableRequirement, ...]
+    _aborted: Optional[Exception]
 
     def __init__(self, table: Table, autocommit: bool = False):
         """Open a transaction to stage and commit changes to a table.
@@ -260,6 +261,15 @@ class Transaction:
         self._autocommit = autocommit
         self._updates = ()
         self._requirements = ()
+        self._aborted = None
+
+    def _aborted_error(self) -> Exception:
+        """Return the error to raise for operations on a transaction that already failed."""
+        return RuntimeError(f"Transaction is aborted after a failed update_rows and can no longer be used: {self._aborted}")
+
+    def _ensure_active(self) -> None:
+        if self._aborted is not None:
+            raise self._aborted_error()
 
     def __enter__(self) -> Transaction:
         """Start a transaction to update the table."""
@@ -274,6 +284,7 @@ class Transaction:
 
     def _apply(self, updates: Tuple[TableUpdate, ...], requirements: Tuple[TableRequirement, ...] = ()) -> Transaction:
         """Check if the requirements are met, and applies the updates to the metadata."""
+        self._ensure_active()
         for requirement in requirements:
             requirement.validate(self.table_metadata)
 
@@ -423,6 +434,7 @@ class Transaction:
         Returns:
             A new UpdateSchema.
         """
+        self._ensure_active()
         return UpdateSchema(
             self,
             allow_incompatible_changes=allow_incompatible_changes,
@@ -436,6 +448,7 @@ class Transaction:
         Returns:
             A new UpdateSnapshot
         """
+        self._ensure_active()
         return UpdateSnapshot(self, io=self._table.io, snapshot_properties=snapshot_properties)
 
     def append(self, df: pa.Table, snapshot_properties: Dict[str, str] = EMPTY_DICT) -> None:
@@ -446,6 +459,7 @@ class Transaction:
             df: The Arrow dataframe that will be appended to overwrite the table
             snapshot_properties: Custom properties to be added to the snapshot summary
         """
+        self._ensure_active()
         try:
             import pyarrow as pa
         except ModuleNotFoundError as e:
@@ -490,6 +504,7 @@ class Transaction:
             df: The Arrow dataframe that will be used to overwrite the table
             snapshot_properties: Custom properties to be added to the snapshot summary
         """
+        self._ensure_active()
         try:
             import pyarrow as pa
         except ModuleNotFoundError as e:
@@ -557,6 +572,7 @@ class Transaction:
             case_sensitive: A bool determine if the provided `overwrite_filter` is case-sensitive
             snapshot_properties: Custom properties to be added to the snapshot summary
         """
+        self._ensure_active()
         try:
             import pyarrow as pa
         except ModuleNotFoundError as e:
@@ -610,6 +626,7 @@ class Transaction:
             snapshot_properties: Custom properties to be added to the snapshot summary
             case_sensitive: A bool determine if the provided `delete_filter` is case-sensitive
         """
+        self._ensure_active()
         from pyiceberg.io.pyarrow import (
             ArrowScan,
             _dataframe_to_data_files,
@@ -699,6 +716,7 @@ class Transaction:
             ValueError: Raises a ValueError given file_paths contains duplicate files
             ValueError: Raises a ValueError given file_paths already referenced by table
         """
+        self._ensure_active()
         if len(file_paths) != len(set(file_paths)):
             raise ValueError("File paths must be unique")
 
@@ -728,6 +746,7 @@ class Transaction:
         Returns:
             A new UpdateSpec.
         """
+        self._ensure_active()
         return UpdateSpec(self)
 
     def remove_properties(self, *removals: str) -> Transaction:
@@ -739,7 +758,66 @@ class Transaction:
         Returns:
             The alter table builder.
         """
+        self._ensure_active()
         return self._apply((RemovePropertiesUpdate(removals=removals),))
+
+    def update_rows(
+        self,
+        assignments: Dict[str, Any],
+        row_filter: Union[str, BooleanExpression] = ALWAYS_TRUE,
+        *,
+        case_sensitive: bool = True,
+        snapshot_properties: Optional[Dict[str, str]] = None,
+    ) -> int:
+        """Update the values of the rows that currently match ``row_filter``.
+
+        This stages at most one OVERWRITE snapshot in the transaction (and
+        publishes nothing at all when no value changes).  When the transaction
+        is later committed, that snapshot atomically invalidates the old data
+        files and adds the rewritten ones.  A failed call aborts the
+        transaction: it can no longer be used to stage or commit anything.
+
+        Args:
+            assignments: A non-empty mapping of top-level atomic field name to
+                either a Python scalar (``None`` included) that is exactly
+                accepted by the field type or a
+                :class:`pyiceberg.expressions.ColumnRef` that copies the
+                pre-update value of another top-level field.  Strings are
+                always treated as string constants.
+            row_filter: The existing expression, string syntax and null
+                semantics are used to select rows.
+            case_sensitive: Whether field names in ``assignments``,
+                ``ColumnRef`` and ``row_filter`` are matched case-sensitively.
+            snapshot_properties: Custom properties to add to the snapshot summary.
+
+        Returns:
+            The number of rows whose value actually changed.  Duplicate rows
+            each count once.
+
+        Raises:
+            ValueError: For an empty mapping, unknown or ambiguous fields,
+                nested/list/map/struct targets, assigning null to a required
+                field, values that are not exactly accepted by the field type,
+                and lossy ``ColumnRef`` promotions.  When the transaction has
+                already failed, a ``RuntimeError`` is raised instead.
+        """
+        from pyiceberg.table.update_rows import update_rows as _update_rows
+
+        self._ensure_active()
+        try:
+            return _update_rows(
+                self,
+                assignments,
+                row_filter=row_filter,
+                case_sensitive=case_sensitive,
+                snapshot_properties=snapshot_properties,
+            )
+        except Exception as exc:
+            # A failed correction leaves no partial state behind, and the
+            # transaction is terminated so that the previously staged changes
+            # can never be committed by accident.
+            self._aborted = exc
+            raise
 
     def update_location(self, location: str) -> Transaction:
         """Set the new table location.
@@ -757,7 +835,11 @@ class Transaction:
 
         Returns:
             The table with the updates applied.
+
+        Raises:
+            RuntimeError: When the transaction has been aborted by a failed ``update_rows``.
         """
+        self._ensure_active()
         if len(self._updates) > 0:
             self._requirements += (AssertTableUUID(uuid=self.table_metadata.table_uuid),)
             self._table._do_commit(  # pylint: disable=W0212
@@ -1216,6 +1298,65 @@ class Table:
                     tx.append(rows_to_insert)
 
         return UpsertResult(rows_updated=update_row_cnt, rows_inserted=insert_row_cnt)
+
+    def update_rows(
+        self,
+        assignments: Dict[str, Any],
+        row_filter: Union[str, BooleanExpression] = ALWAYS_TRUE,
+        *,
+        case_sensitive: bool = True,
+        snapshot_properties: Optional[Dict[str, str]] = None,
+    ) -> int:
+        """Update the values of the rows that currently match ``row_filter``.
+
+        This operates directly on the rows that are alive in the table, without
+        having to prepare a replacement data set and matching it by key.
+
+        All right-hand sides and the row filter are evaluated against the rows
+        as they were before the update, so ``{"a": ColumnRef("b"),
+        "b": ColumnRef("a")}`` swaps two columns.  A successful update publishes
+        a single OVERWRITE snapshot that both invalidates the old rows and adds
+        the rewritten files.  When nothing changes (empty table, no matching
+        rows, or all matching rows already hold the assigned values) ``0`` is
+        returned and no snapshot is created.
+
+        Args:
+            assignments: A non-empty mapping of top-level atomic field name to
+                either a Python scalar (``None`` included) that is exactly
+                accepted by the field type, or
+                :class:`pyiceberg.expressions.ColumnRef` naming another
+                top-level field whose pre-update value is copied.  Plain
+                strings are always string constants.
+            row_filter: The rows to update, using the existing expressions,
+                string syntax and null semantics.
+            case_sensitive: Whether field names in ``assignments``,
+                ``ColumnRef`` and ``row_filter`` are matched case-sensitively.
+                Ambiguous case-folded names are rejected.
+            snapshot_properties: Custom properties to add to the snapshot summary.
+
+        Returns:
+            The number of rows whose value actually changed.  Duplicate rows
+            each count once.
+
+        Raises:
+            ValueError: For an empty mapping, unknown or ambiguous fields,
+                nested/list/map/struct targets, assigning null to a required
+                field, values that are not exactly accepted by the field type
+                (no truncation, rounding or clipping) and lossy ``ColumnRef``
+                promotions.
+
+        Note:
+            The table must use format-version=2 and Parquet data files.  Data
+            files that the scan planning and their metadata prove cannot
+            match are neither opened nor rewritten.
+        """
+        with self.transaction() as tx:
+            return tx.update_rows(
+                assignments,
+                row_filter=row_filter,
+                case_sensitive=case_sensitive,
+                snapshot_properties=snapshot_properties,
+            )
 
     def append(self, df: pa.Table, snapshot_properties: Dict[str, str] = EMPTY_DICT) -> None:
         """

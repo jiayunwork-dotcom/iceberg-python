@@ -686,51 +686,59 @@ def _convert_scalar(value: Any, iceberg_type: IcebergType) -> pa.scalar:
 
 
 class _ConvertToArrowExpression(BoundBooleanExpressionVisitor[pc.Expression]):
+    def __init__(self, field_paths: Optional[Dict[int, Tuple[str, ...]]] = None) -> None:
+        super().__init__()
+        self._field_paths = field_paths or {}
+
+    def _field(self, term: BoundTerm[Any]) -> pc.Expression:
+        field = term.ref().field
+        if path := self._field_paths.get(field.field_id):
+            return pc.field(*path)
+        return pc.field(field.name)
+
     def visit_in(self, term: BoundTerm[Any], literals: Set[Any]) -> pc.Expression:
         pyarrow_literals = pa.array(literals, type=schema_to_pyarrow(term.ref().field.field_type))
-        return pc.field(term.ref().field.name).isin(pyarrow_literals)
+        return self._field(term).isin(pyarrow_literals)
 
     def visit_not_in(self, term: BoundTerm[Any], literals: Set[Any]) -> pc.Expression:
         pyarrow_literals = pa.array(literals, type=schema_to_pyarrow(term.ref().field.field_type))
-        return ~pc.field(term.ref().field.name).isin(pyarrow_literals)
+        return ~self._field(term).isin(pyarrow_literals)
 
     def visit_is_nan(self, term: BoundTerm[Any]) -> pc.Expression:
-        ref = pc.field(term.ref().field.name)
-        return pc.is_nan(ref)
+        return pc.is_nan(self._field(term))
 
     def visit_not_nan(self, term: BoundTerm[Any]) -> pc.Expression:
-        ref = pc.field(term.ref().field.name)
-        return ~pc.is_nan(ref)
+        return ~pc.is_nan(self._field(term))
 
     def visit_is_null(self, term: BoundTerm[Any]) -> pc.Expression:
-        return pc.field(term.ref().field.name).is_null(nan_is_null=False)
+        return self._field(term).is_null(nan_is_null=False)
 
     def visit_not_null(self, term: BoundTerm[Any]) -> pc.Expression:
-        return pc.field(term.ref().field.name).is_valid()
+        return self._field(term).is_valid()
 
     def visit_equal(self, term: BoundTerm[Any], literal: Literal[Any]) -> pc.Expression:
-        return pc.field(term.ref().field.name) == _convert_scalar(literal.value, term.ref().field.field_type)
+        return self._field(term) == _convert_scalar(literal.value, term.ref().field.field_type)
 
     def visit_not_equal(self, term: BoundTerm[Any], literal: Literal[Any]) -> pc.Expression:
-        return pc.field(term.ref().field.name) != _convert_scalar(literal.value, term.ref().field.field_type)
+        return self._field(term) != _convert_scalar(literal.value, term.ref().field.field_type)
 
     def visit_greater_than_or_equal(self, term: BoundTerm[Any], literal: Literal[Any]) -> pc.Expression:
-        return pc.field(term.ref().field.name) >= _convert_scalar(literal.value, term.ref().field.field_type)
+        return self._field(term) >= _convert_scalar(literal.value, term.ref().field.field_type)
 
     def visit_greater_than(self, term: BoundTerm[Any], literal: Literal[Any]) -> pc.Expression:
-        return pc.field(term.ref().field.name) > _convert_scalar(literal.value, term.ref().field.field_type)
+        return self._field(term) > _convert_scalar(literal.value, term.ref().field.field_type)
 
     def visit_less_than(self, term: BoundTerm[Any], literal: Literal[Any]) -> pc.Expression:
-        return pc.field(term.ref().field.name) < _convert_scalar(literal.value, term.ref().field.field_type)
+        return self._field(term) < _convert_scalar(literal.value, term.ref().field.field_type)
 
     def visit_less_than_or_equal(self, term: BoundTerm[Any], literal: Literal[Any]) -> pc.Expression:
-        return pc.field(term.ref().field.name) <= _convert_scalar(literal.value, term.ref().field.field_type)
+        return self._field(term) <= _convert_scalar(literal.value, term.ref().field.field_type)
 
     def visit_starts_with(self, term: BoundTerm[Any], literal: Literal[Any]) -> pc.Expression:
-        return pc.starts_with(pc.field(term.ref().field.name), literal.value)
+        return pc.starts_with(self._field(term), literal.value)
 
     def visit_not_starts_with(self, term: BoundTerm[Any], literal: Literal[Any]) -> pc.Expression:
-        return ~pc.starts_with(pc.field(term.ref().field.name), literal.value)
+        return ~pc.starts_with(self._field(term), literal.value)
 
     def visit_true(self) -> pc.Expression:
         return pc.scalar(True)
@@ -866,8 +874,16 @@ class _NullNaNUnmentionedTermsCollector(BoundBooleanExpressionVisitor[None]):
         boolean_expression_visit(expr, self)
 
 
-def expression_to_pyarrow(expr: BooleanExpression) -> pc.Expression:
-    return boolean_expression_visit(expr, _ConvertToArrowExpression())
+def expression_to_pyarrow(expr: BooleanExpression, field_paths: Optional[Dict[int, Tuple[str, ...]]] = None) -> pc.Expression:
+    """Convert a bound expression to a PyArrow compute expression.
+
+    Args:
+        expr: The bound expression.
+        field_paths: Optional mapping of field id to the nested path of the
+            column in the Arrow table.  When given, references are translated
+            to those paths; otherwise the top-level field name is used.
+    """
+    return boolean_expression_visit(expr, _ConvertToArrowExpression(field_paths))
 
 
 def _expression_to_complementary_pyarrow(expr: BooleanExpression) -> pc.Expression:
