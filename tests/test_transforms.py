@@ -926,12 +926,12 @@ def test_projection_truncate_decimal_literal_gte(bound_reference_decimal: BoundR
 
 def test_projection_truncate_decimal_in(bound_reference_decimal: BoundReference[Decimal]) -> None:
     assert TruncateTransform(2).project(
-        "name", BoundIn(term=bound_reference_decimal, literals={literal(Decimal(19.25)), literal(Decimal(18.15))})
+        "name", BoundIn(term=bound_reference_decimal, literals={literal(Decimal(19.25)), literal(Decimal("18.15"))})
     ) == In(
         term="name",
         literals={
             Decimal("19.24"),
-            Decimal("18.14999999999999857891452847979962825775146484374"),
+            Decimal("18.14"),
         },
     )
 
@@ -956,12 +956,12 @@ def test_projection_truncate_long_literal_gte(bound_reference_decimal: BoundRefe
 
 def test_projection_truncate_long_in(bound_reference_decimal: BoundReference[Decimal]) -> None:
     assert TruncateTransform(2).project(
-        "name", BoundIn(term=bound_reference_decimal, literals={DecimalLiteral(Decimal(19.25)), DecimalLiteral(Decimal(18.15))})
+        "name", BoundIn(term=bound_reference_decimal, literals={DecimalLiteral(Decimal(19.25)), DecimalLiteral(Decimal("18.15"))})
     ) == In(
         term="name",
         literals={
             Decimal("19.24"),
-            Decimal("18.14999999999999857891452847979962825775146484374"),
+            Decimal("18.14"),
         },
     )
 

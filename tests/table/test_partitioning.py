@@ -183,7 +183,7 @@ def test_partition_type(table_schema_simple: Schema) -> None:
     [
         (IntegerType(), 22),
         (LongType(), 22),
-        (DecimalType(5, 9), Decimal(19.25)),
+        (DecimalType(9, 2), Decimal("19.25")),
         (DateType(), datetime.date(1925, 5, 22)),
         (TimeType(), datetime.time(19, 25, 00)),
         (TimestampType(), datetime.datetime(19, 5, 1, 22, 1, 1)),

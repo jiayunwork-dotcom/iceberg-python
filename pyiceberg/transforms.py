@@ -79,7 +79,7 @@ from pyiceberg.types import (
     UUIDType,
 )
 from pyiceberg.utils import datetime
-from pyiceberg.utils.decimal import decimal_to_bytes, truncate_decimal
+from pyiceberg.utils.decimal import decimal_to_minimal_bytes_at_scale, truncate_decimal_at_scale
 from pyiceberg.utils.parsing import ParseNumberFromBrackets
 from pyiceberg.utils.singleton import Singleton
 
@@ -243,7 +243,9 @@ class BucketTransform(Transform[S, int]):
         raise NotImplementedError()
 
     def apply(self, value: Optional[S]) -> Optional[int]:
-        return (self.hash(value) & IntegerType.max) % self._num_buckets if value else None
+        # Only null maps to null. In particular a decimal zero (or an empty
+        # string) is a real value and must still be hashed.
+        return (self.hash(value) & IntegerType.max) % self._num_buckets if value is not None else None
 
     def result_type(self, source: IcebergType) -> IcebergType:
         return IntegerType()
@@ -331,7 +333,11 @@ class BucketTransform(Transform[S, int]):
         elif isinstance(source, DecimalType):
 
             def hash_func(v: Any) -> int:
-                return mmh3.hash(decimal_to_bytes(v))
+                # Encode at the column's declared scale so that every spelling
+                # of the same numeric value hashes identically (bucket(100.00)
+                # == bucket(1E+2)). The minimal two's complement encoding of
+                # the unscaled value is what the Iceberg spec hashes.
+                return mmh3.hash(decimal_to_minimal_bytes_at_scale(v, source.scale))
 
         elif isinstance(source, (StringType, FixedType, BinaryType)):
 
@@ -359,7 +365,33 @@ class BucketTransform(Transform[S, int]):
     def pyarrow_transform(self, source: IcebergType) -> "Callable[[pa.Array], pa.Array]":
         from pyiceberg_core import transform as pyiceberg_core_transform
 
-        return self._pyiceberg_transform_wrapper(pyiceberg_core_transform.bucket, self._num_buckets)
+        core_transform = self._pyiceberg_transform_wrapper(pyiceberg_core_transform.bucket, self._num_buckets)
+        if isinstance(source, DecimalType):
+            # pyiceberg-core hashes negative decimals in a fixed 16-byte
+            # representation, which does not match the Iceberg spec (and the
+            # Python implementation). Route decimal columns through the
+            # spec-conforming Python hash so partition values stay consistent.
+            return self._decimal_pyarrow_transform(source)
+        return core_transform
+
+    def _decimal_pyarrow_transform(self, source: DecimalType) -> "Callable[[pa.Array], pa.Array]":
+        try:
+            import pyarrow as pa
+        except ModuleNotFoundError as e:
+            raise ModuleNotFoundError("For bucket/truncate transforms, PyArrow needs to be installed") from e
+
+        transformer = self.transform(source)
+
+        def _transform(array: "ArrayLike") -> "ArrayLike":
+            if isinstance(array, pa.ChunkedArray):
+                return pa.chunked_array([_transform(arr) for arr in array.iterchunks()])
+            elif not isinstance(array, pa.Array):
+                raise ValueError(f"PyArrow array can only be of type pa.Array or pa.ChunkedArray, but found {type(array)}")
+
+            values = array.to_pylist()
+            return pa.array([transformer(value) for value in values], type=pa.int32())
+
+        return _transform
 
     @property
     def supports_pyarrow_transform(self) -> bool:
@@ -871,7 +903,9 @@ class TruncateTransform(Transform[S, S]):
         elif isinstance(source, DecimalType):
 
             def truncate_func(v: Any) -> Any:
-                return truncate_decimal(v, self._width)
+                # Truncate in unscaled units at the declared scale, so the
+                # result does not depend on how the input was spelled.
+                return truncate_decimal_at_scale(v, self._width, source.scale)
 
         else:
             raise ValueError(f"Cannot truncate for type: {source}")

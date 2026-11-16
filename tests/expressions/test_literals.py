@@ -263,15 +263,18 @@ def test_decimal_to_decimal_conversion() -> None:
 
     assert lit.value.as_tuple() == lit.to(DecimalType(9, 2)).value.as_tuple()
     assert lit.value.as_tuple() == lit.to(DecimalType(11, 2)).value.as_tuple()
+    # 34.11 cannot be represented exactly with fewer fractional digits.
     with pytest.raises(ValueError) as e:
         _ = lit.to(DecimalType(9, 0))
     assert "Could not convert 34.11 into a decimal(9, 0)" in str(e.value)
     with pytest.raises(ValueError) as e:
         _ = lit.to(DecimalType(9, 1))
     assert "Could not convert 34.11 into a decimal(9, 1)" in str(e.value)
-    with pytest.raises(ValueError) as e:
-        _ = lit.to(DecimalType(9, 3))
-    assert "Could not convert 34.11 into a decimal(9, 3)" in str(e.value)
+    # A wider declared scale only adds trailing zeros; the value is preserved
+    # exactly and is returned with the declared scale.
+    widened = lit.to(DecimalType(9, 3))
+    assert widened.value == Decimal("34.11")
+    assert widened.value.as_tuple() == Decimal("34.110").as_tuple()
 
 
 def test_timestamp_to_date() -> None:
@@ -718,10 +721,13 @@ def test_invalid_timestamp_conversions() -> None:
 
 
 def test_invalid_decimal_conversion_scale() -> None:
-    lit = literal(Decimal("34.11"))
+    # Rounding is never allowed, so a value with more fractional digits than
+    # the declared scale is still rejected (widening the scale is exact).
+    lit = literal(Decimal("34.115"))
     with pytest.raises(ValueError) as e:
-        lit.to(DecimalType(9, 4))
-    assert "Could not convert 34.11 into a decimal(9, 4)" in str(e.value)
+        lit.to(DecimalType(9, 2))
+    assert "Could not convert 34.115 into a decimal(9, 2)" in str(e.value)
+    assert literal(Decimal("34.11")).to(DecimalType(9, 4)).value == Decimal("34.11")
 
 
 def test_invalid_decimal_conversions() -> None:

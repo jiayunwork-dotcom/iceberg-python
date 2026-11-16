@@ -24,7 +24,7 @@ from __future__ import annotations
 import struct
 from abc import ABC, abstractmethod
 from datetime import date, datetime
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import Decimal
 from functools import singledispatchmethod
 from math import isnan
 from typing import Any, Generic, Type
@@ -57,7 +57,14 @@ from pyiceberg.utils.datetime import (
     timestamp_to_micros,
     timestamptz_to_micros,
 )
-from pyiceberg.utils.decimal import decimal_to_unscaled, unscaled_to_decimal
+from pyiceberg.utils.decimal import (
+    decimal_canonical,
+    decimal_from_float,
+    decimal_rescale,
+    decimal_to_integral,
+    decimal_to_unscaled,
+    unscaled_to_decimal,
+)
 from pyiceberg.utils.singleton import Singleton
 
 UUID_BYTES_LENGTH = 16
@@ -324,13 +331,9 @@ class LongLiteral(Literal[int]):
 
     @to.register(DecimalType)
     def _(self, type_var: DecimalType) -> Literal[Decimal]:
-        unscaled = Decimal(self.value)
-        if type_var.scale == 0:
-            return DecimalLiteral(unscaled)
-        else:
-            sign, digits, _ = unscaled.as_tuple()
-            zeros = (0,) * type_var.scale
-            return DecimalLiteral(Decimal((sign, digits + zeros, -type_var.scale)))
+        # Integer inputs are exact; encode them at the declared scale without
+        # going through float. ``decimal_canonical`` also enforces precision.
+        return DecimalLiteral(decimal_canonical(Decimal(self.value), type_var.precision, type_var.scale))
 
 
 class FloatLiteral(Literal[float]):
@@ -376,7 +379,10 @@ class FloatLiteral(Literal[float]):
 
     @to.register(DecimalType)
     def _(self, type_var: DecimalType) -> Literal[Decimal]:
-        return DecimalLiteral(Decimal(self.value).quantize(Decimal((0, (1,), -type_var.scale)), rounding=ROUND_HALF_UP))
+        # Float inputs keep their historical round-half-up behaviour, but the
+        # rounding is computed with integer arithmetic so it is independent of
+        # the caller's decimal context.
+        return DecimalLiteral(decimal_from_float(self.value, type_var.scale))
 
 
 class DoubleLiteral(Literal[float]):
@@ -401,7 +407,10 @@ class DoubleLiteral(Literal[float]):
 
     @to.register(DecimalType)
     def _(self, type_var: DecimalType) -> Literal[Decimal]:
-        return DecimalLiteral(Decimal(self.value).quantize(Decimal((0, (1,), -type_var.scale)), rounding=ROUND_HALF_UP))
+        # Float inputs keep their historical round-half-up behaviour, but the
+        # rounding is computed with integer arithmetic so it is independent of
+        # the caller's decimal context.
+        return DecimalLiteral(decimal_from_float(self.value, type_var.scale))
 
 
 class DateLiteral(Literal[int]):
@@ -467,15 +476,27 @@ class DecimalLiteral(Literal[Decimal]):
     def __init__(self, value: Decimal) -> None:
         super().__init__(value, Decimal)
 
+    def _coefficient_and_exponent(self) -> tuple[int, int]:
+        _, _, exponent = self.value.as_tuple()
+        if not isinstance(exponent, int):
+            raise ValueError(f"Cannot operate on a non-finite decimal: {self.value}")
+        return decimal_to_unscaled(self.value), exponent
+
+    def _with_delta(self, delta: int) -> Literal[Decimal]:
+        coefficient, exponent = self._coefficient_and_exponent()
+        new_coefficient = coefficient + delta
+        sign = 0 if new_coefficient >= 0 else 1
+        digits = tuple(int(digit) for digit in str(abs(new_coefficient)))
+        return DecimalLiteral(Decimal((sign, digits, exponent)))
+
     def increment(self) -> Literal[Decimal]:
-        original_scale = abs(int(self.value.as_tuple().exponent))
-        unscaled = decimal_to_unscaled(self.value)
-        return DecimalLiteral(unscaled_to_decimal(unscaled + 1, original_scale))
+        # Step by one unit of the smallest represented digit, keeping the
+        # literal's own exponent (also for values written with a positive
+        # exponent such as 1E+2). Context-independent.
+        return self._with_delta(1)
 
     def decrement(self) -> Literal[Decimal]:
-        original_scale = abs(int(self.value.as_tuple().exponent))
-        unscaled = decimal_to_unscaled(self.value)
-        return DecimalLiteral(unscaled_to_decimal(unscaled - 1, original_scale))
+        return self._with_delta(-1)
 
     @singledispatchmethod
     def to(self, type_var: IcebergType) -> Literal:  # type: ignore
@@ -483,13 +504,20 @@ class DecimalLiteral(Literal[Decimal]):
 
     @to.register(DecimalType)
     def _(self, type_var: DecimalType) -> Literal[Decimal]:
-        if type_var.scale == abs(int(self.value.as_tuple().exponent)):
+        # Accept any spelling whose numeric value is exactly representable at
+        # the declared scale and fits the declared precision. This canonical
+        # form makes 100.00, 1E+2, 100 and 100.000 indistinguishable.
+        try:
+            canonical = decimal_canonical(self.value, type_var.precision, type_var.scale)
+        except ValueError as e:
+            raise ValueError(f"Could not convert {self.value} into a {type_var}") from e
+        if canonical.as_tuple() == self.value.as_tuple():
             return self
-        raise ValueError(f"Could not convert {self.value} into a {type_var}")
+        return DecimalLiteral(canonical)
 
     @to.register(IntegerType)
     def _(self, _: IntegerType) -> Literal[int]:
-        value_int = int(self.value.to_integral_value())
+        value_int = decimal_to_integral(self.value)
         if value_int > IntegerType.max:
             return IntAboveMax()
         elif value_int < IntegerType.min:
@@ -499,7 +527,7 @@ class DecimalLiteral(Literal[Decimal]):
 
     @to.register(LongType)
     def _(self, _: LongType) -> Literal[int]:
-        value_int = int(self.value.to_integral_value())
+        value_int = decimal_to_integral(self.value)
         if value_int > LongType.max:
             return IntAboveMax()
         elif value_int < LongType.min:
@@ -588,12 +616,25 @@ class StringLiteral(Literal[str]):
 
     @to.register(DecimalType)
     def _(self, type_var: DecimalType) -> Literal[Decimal]:
-        dec = Decimal(self.value)
-        scale = abs(int(dec.as_tuple().exponent))
-        if type_var.scale == scale:
-            return DecimalLiteral(dec)
-        else:
-            raise ValueError(f"Could not convert {self.value} into a {type_var}, scales differ {type_var.scale} <> {scale}")
+        try:
+            dec = Decimal(self.value)
+        except Exception as e:
+            raise ValueError(f"Could not convert {self.value} into a {type_var}") from e
+        try:
+            canonical = decimal_canonical(dec, type_var.precision, type_var.scale)
+        except ValueError as e:
+            _, _, exponent = dec.as_tuple()
+            if not isinstance(exponent, int):
+                raise ValueError(f"Could not convert {self.value} into a {type_var}") from e
+            try:
+                decimal_rescale(dec, type_var.scale)
+            except ValueError:
+                scale = abs(exponent)
+                raise ValueError(
+                    f"Could not convert {self.value} into a {type_var}, scales differ {type_var.scale} <> {scale}"
+                ) from e
+            raise ValueError(f"Could not convert {self.value} into a {type_var}") from e
+        return DecimalLiteral(canonical if canonical.as_tuple() != dec.as_tuple() else dec)
 
     @to.register(BooleanType)
     def _(self, type_var: BooleanType) -> Literal[bool]:

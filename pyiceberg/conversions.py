@@ -60,7 +60,14 @@ from pyiceberg.types import (
     strtobool,
 )
 from pyiceberg.utils.datetime import date_to_days, datetime_to_micros, time_to_micros
-from pyiceberg.utils.decimal import decimal_to_bytes, unscaled_to_decimal
+from pyiceberg.utils.decimal import (
+    bytes_required,
+    decimal_encode,
+    decimal_rescale,
+    decimal_to_bytes_at_scale,
+    decimal_unscaled_at_scale,
+    unscaled_to_decimal,
+)
 
 _BOOL_STRUCT = Struct("<?")
 _INT_STRUCT = Struct("<i")
@@ -245,6 +252,11 @@ def _(_: PrimitiveType, value: bytes) -> bytes:
 def _(primitive_type: DecimalType, value: Decimal) -> bytes:
     """Convert a Decimal value to bytes given a DecimalType instance with defined precision and scale.
 
+    The value is encoded at the declared scale. Any spelling of the same
+    numeric value (``100.00``, ``1E+2``, ``100``) produces the same bytes; a
+    value that cannot be represented exactly (it would need rounding) or that
+    does not fit the declared precision is rejected.
+
     Args:
         primitive_type (DecimalType): A DecimalType instance with precision and scale.
         value (Decimal): A Decimal instance.
@@ -256,16 +268,24 @@ def _(primitive_type: DecimalType, value: Decimal) -> bytes:
     Returns:
         bytes: The byte representation of `value`.
     """
-    _, digits, exponent = value.as_tuple()
-    exponent = abs(int(exponent))
-    if exponent != primitive_type.scale:
-        raise ValueError(f"Cannot serialize value, scale of value does not match type {primitive_type}: {exponent}")
-    elif len(digits) > primitive_type.precision:
+    _, _, exponent = value.as_tuple()
+    try:
+        unscaled = decimal_encode(value, primitive_type.precision, primitive_type.scale)
+    except ValueError as e:
+        # Preserve the historical diagnostics: a value that needs rounding is
+        # reported as a scale mismatch, while one that fits the scale but not
+        # the precision is reported as a precision overflow.
+        try:
+            decimal_rescale(value, primitive_type.scale)
+        except ValueError:
+            scale = abs(exponent) if isinstance(exponent, int) else value
+            raise ValueError(f"Cannot serialize value, scale of value does not match type {primitive_type}: {scale}") from e
+        digits = len(str(abs(decimal_unscaled_at_scale(value, primitive_type.scale))))
         raise ValueError(
-            f"Cannot serialize value, precision of value is greater than precision of type {primitive_type}: {len(digits)}"
-        )
+            f"Cannot serialize value, precision of value is greater than precision of type {primitive_type}: {digits}"
+        ) from e
 
-    return decimal_to_bytes(value)
+    return decimal_to_bytes_at_scale(value, primitive_type.scale, byte_length=bytes_required(unscaled))
 
 
 @singledispatch  # type: ignore
