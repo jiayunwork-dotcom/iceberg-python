@@ -1447,6 +1447,78 @@ The low level API `plan_files` methods returns a set of tasks that provide the f
 
 In this case it is up to the engine itself to filter the file itself. Below, `to_arrow()` and `to_duckdb()` that already do this for you.
 
+### Equality deletes
+
+PyIceberg 0.10 reads Iceberg **format v2** equality delete files on local Parquet
+tables; nothing needs to be rewritten first. Equality deletes are produced by
+other writers (for example a Spark `MERGE`/`DELETE` that writes merge-on-read
+deletes), and are applied at read time by `table.scan().to_arrow()`,
+`to_arrow_batch_reader()`, `to_pandas()`, `to_polars()`, `to_duckdb()` and
+`count()`.
+
+A row is deleted when its values equal **all** of a delete file's
+`equality_ids` columns for some row in an applicable delete file. Matching is by
+**field id**, not by name, so renamed columns still match. A delete file applies
+only to data files that are:
+
+* **strictly older** — the data file's data sequence number is *less than* the
+  delete file's data sequence number (data added at the same sequence is never
+  removed by that delete), and
+* in the **same partition** (same partition spec id *and* equal partition values),
+  or the delete file uses an **unpartitioned spec**, in which case it is a
+  **global** delete that applies to every partition.
+
+Supported delete keys are top-level `boolean`, `int`, `long` and `string`
+columns, singly or as a composite. Null values compare equal to null
+(`NULL IS NULL`). Other key types raise `ValueError`; values are never coerced or
+stringified. Composite keys require every component to match. Duplicate delete
+keys and duplicate delete file contents have no extra effect, and two data rows
+with identical values remain two independent physical rows.
+
+Schema evolution is handled: a delete key that has been renamed or dropped from
+the current schema is still resolved by field id, and a key column added after a
+data file was written reads as `null` for that file. Legal `int` → `long`
+promotion matches correctly. Keys are never added to the returned columns, so the
+projection is exactly what you selected.
+
+Position deletes and equality deletes can coexist. Position deletes always refer
+to the original row numbers of the data file, so positions are unaffected by
+equality deletes or by the row filter. `to_arrow()`,
+`to_arrow_batch_reader()` and an unlimited `count()` agree on the surviving rows
+for the same snapshot and row filter; `limit` applies after deletes and filtering.
+
+#### Memory budget
+
+Equality delete matching keeps the *distinct* delete keys, a probe index and a
+per-batch match bitmap in memory, on top of the normal data read. Bound that
+extra state with the `equality-delete-memory-budget` scan option — a decimal
+string of a positive integer, in bytes:
+
+```python
+table.scan(
+    options={"equality-delete-memory-budget": "67108864"},
+).to_arrow()
+```
+
+* Default: `67108864` (64 MiB). Minimum: `65536` (64 KiB).
+* The budget is **per scan**, shared by all file tasks that run in parallel —
+  not one full copy per task.
+* Only equality-delete state counts: the decoded keys, their index and the match
+  bitmap. Regular data-read batches, the final output table, the filesystem page
+  cache and fixed Parquet decoder overheads are accounted for separately.
+* Invalid values (non-decimal, zero, negative, `65536.0`, `1e6`, below the
+  minimum, …) raise `ValueError` **before any data page is opened**.
+* A single key that cannot fit the whole budget raises a `ValueError`
+  (`EqualityDeleteMemoryError`) as soon as it is decoded. A large *number* of
+  small keys is fine: the store spills to temporary Arrow IPC files and is
+  probed a segment at a time.
+
+Delete files are decoded once per scan and the resulting key set is reused by
+every data file the delete applies to, so the cost of a large delete set does not
+multiply with the number of data files. Temporary spill files are removed as soon
+as the scan finishes, fails, or a `to_arrow_batch_reader()` is closed. The source
+table, its metadata and delete files are never modified.
+
 ### Apache Arrow
 
 <!-- prettier-ignore-start -->

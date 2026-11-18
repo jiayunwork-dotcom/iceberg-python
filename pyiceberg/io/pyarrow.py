@@ -45,11 +45,13 @@ from typing import (
     Any,
     Callable,
     Dict,
+    Generator,
     Generic,
     Iterable,
     Iterator,
     List,
     Optional,
+    Sequence,
     Set,
     Tuple,
     TypeVar,
@@ -72,6 +74,7 @@ from pyarrow.fs import (
 )
 
 from pyiceberg.conversions import to_bytes
+from pyiceberg.equality_deletes import DEFAULT_EQUALITY_DELETE_MEMORY_BUDGET, EqualityDeleteFile
 from pyiceberg.exceptions import ResolveError
 from pyiceberg.expressions import AlwaysTrue, BooleanExpression, BoundIsNaN, BoundIsNull, BoundTerm, Not, Or
 from pyiceberg.expressions.literals import Literal
@@ -192,6 +195,7 @@ from pyiceberg.utils.singleton import Singleton
 from pyiceberg.utils.truncate import truncate_upper_bound_binary_string, truncate_upper_bound_text_string
 
 if TYPE_CHECKING:
+    from pyiceberg.io.equality_deletes import EqualityDeleteContext, ResolvedEqualityDelete
     from pyiceberg.table import FileScanTask, WriteTask
 
 logger = logging.getLogger(__name__)
@@ -1482,6 +1486,58 @@ def _get_column_projection_values(
     return projected_missing_fields
 
 
+def _new_equality_delete_context(tasks: Iterable[FileScanTask], budget: int) -> Optional["EqualityDeleteContext"]:
+    """Create a scan-scoped equality delete context when any task needs one."""
+    if not any(task.equality_delete_files for task in tasks):
+        return None
+    from pyiceberg.io.equality_deletes import EqualityDeleteContext
+
+    return EqualityDeleteContext(budget=budget)
+
+
+def _prepare_equality_deletes(
+    io: FileIO,
+    task: FileScanTask,
+    file_schema: Schema,
+    delete_context: Optional["EqualityDeleteContext"],
+) -> List["ResolvedEqualityDelete"]:
+    """Resolve a task's applicable equality deletes against this data file.
+
+    Key columns are located by field id in the data file's schema, independent of
+    the user projection, so a renamed or unselected delete key is still applied.
+    """
+    delete_files: Iterable[EqualityDeleteFile] = task.equality_delete_files
+    if not delete_files:
+        return []
+    if delete_context is None:
+        raise ValueError("Equality delete context is required to read a task with equality deletes")
+
+    file_columns_by_field_id = {field.field_id: field.name for field in file_schema.fields}
+    resolved = delete_context.resolve(list(delete_files), file_columns_by_field_id)
+    if resolved:
+        delete_context.prepare(io, resolved)
+    return resolved
+
+
+def _equality_key_columns(resolved: Sequence["ResolvedEqualityDelete"]) -> List[str]:
+    names: List[str] = []
+    for descriptor in resolved:
+        for column in descriptor.columns.values():
+            if column is not None and column not in names:
+                names.append(column)
+    return names
+
+
+def _distinct_names(names: Sequence[str]) -> List[str]:
+    seen: Set[str] = set()
+    result: List[str] = []
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            result.append(name)
+    return result
+
+
 def _task_to_record_batches(
     io: FileIO,
     task: FileScanTask,
@@ -1494,6 +1550,7 @@ def _task_to_record_batches(
     partition_spec: Optional[PartitionSpec] = None,
     format_version: TableVersion = TableProperties.DEFAULT_FORMAT_VERSION,
     downcast_ns_timestamp_to_us: Optional[bool] = None,
+    delete_context: Optional["EqualityDeleteContext"] = None,
 ) -> Iterator[pa.RecordBatch]:
     arrow_format = ds.ParquetFileFormat(pre_buffer=True, buffer_size=(ONE_MEGABYTE * 8))
     with io.new_input(task.file.file_path).open() as fin:
@@ -1522,16 +1579,34 @@ def _task_to_record_batches(
             bound_file_filter = bind(file_schema, translated_row_filter, case_sensitive=case_sensitive)
             pyarrow_filter = expression_to_pyarrow(bound_file_filter)
 
-        file_project_schema = prune_columns(file_schema, projected_field_ids, select_full_types=False)
+        # Equality delete keys may be unselected, renamed, or dropped from the
+        # current schema; resolve the physical columns they need by field id from
+        # this file's schema, independent of the user projection.
+        equality_deletes = _prepare_equality_deletes(io, task, file_schema, delete_context)
+        key_column_names = _equality_key_columns(equality_deletes)
 
-        fragment_scanner = ds.Scanner.from_fragment(
-            fragment=fragment,
-            schema=physical_schema,
-            # This will push down the query to Arrow.
-            # But in case there are positional deletes, we have to apply them first
-            filter=pyarrow_filter if not positional_deletes else None,
-            columns=[col.name for col in file_project_schema.columns],
-        )
+        file_project_schema = prune_columns(file_schema, projected_field_ids, select_full_types=False)
+        scan_column_names = _distinct_names([col.name for col in file_project_schema.columns] + key_column_names)
+
+        if positional_deletes or equality_deletes:
+            # Row order must be preserved: position deletes refer to original row
+            # numbers, and equality delete matching must see every physical row
+            # (including duplicate-valued rows) exactly once.  So the user filter
+            # is not pushed into the scanner; it is applied to the batch below.
+            fragment_scanner = ds.Scanner.from_fragment(
+                fragment=fragment,
+                schema=physical_schema,
+                filter=None,
+                columns=scan_column_names,
+            )
+        else:
+            fragment_scanner = ds.Scanner.from_fragment(
+                fragment=fragment,
+                schema=physical_schema,
+                # This will push down the query to Arrow.
+                filter=pyarrow_filter,
+                columns=scan_column_names,
+            )
 
         next_index = 0
         batches = fragment_scanner.to_batches()
@@ -1548,6 +1623,17 @@ def _task_to_record_batches(
             # skip empty batches
             if current_batch.num_rows == 0:
                 continue
+
+            # Apply equality deletes before the user filter.  Removed rows are
+            # identified by key values, not by position, so ordering relative to
+            # the user filter cannot change the surviving set.
+            if equality_deletes:
+                assert delete_context is not None
+                current_batch = delete_context.filter_batch(current_batch, equality_deletes)
+                if current_batch.num_rows == 0:
+                    continue
+                # Only user-requested columns continue downstream.
+                current_batch = current_batch.select([col.name for col in file_project_schema.columns])
 
             # Apply the user filter
             if pyarrow_filter is not None:
@@ -1567,6 +1653,79 @@ def _task_to_record_batches(
                 downcast_ns_timestamp_to_us=downcast_ns_timestamp_to_us,
                 projected_missing_fields=projected_missing_fields,
             )
+
+
+class _ClosingRecordBatchReader:
+    """A ``RecordBatchReader`` proxy that propagates ``close()`` to the scan.
+
+    ``pa.RecordBatchReader`` never calls ``close()`` on the iterable it wraps, so
+    without this proxy an early ``reader.close()`` (or garbage collection of the
+    reader) would leave the equality-delete key stores and temporary spill files
+    alive until the underlying generator is finalised.  The proxy implements the
+    full reader interface, reports itself as a ``RecordBatchReader`` to
+    ``isinstance``/``type`` checks, and supports the Arrow PyCapsule protocol,
+    while forwarding ``close()`` to the generator.
+    """
+
+    _reader: pa.RecordBatchReader
+    _batches: Iterator[pa.RecordBatch]
+    _closed: bool
+
+    def __init__(self, reader: pa.RecordBatchReader, batches: Iterator[pa.RecordBatch]) -> None:
+        object.__setattr__(self, "_reader", reader)
+        object.__setattr__(self, "_batches", batches)
+        object.__setattr__(self, "_closed", False)
+
+    __class__ = property(
+        # Make isinstance(reader, pa.RecordBatchReader) and DuckDB/Arrow's
+        # protocol checks treat this proxy like a real reader.
+        lambda self: pa.RecordBatchReader
+    )
+
+    @property
+    def schema(self) -> pa.Schema:
+        return self._reader.schema
+
+    def __iter__(self) -> "_ClosingRecordBatchReader":
+        return self
+
+    def __next__(self) -> pa.RecordBatch:
+        if self._closed:
+            raise StopIteration
+        return next(self._reader)
+
+    def __arrow_c_stream__(self, requested_schema: object = None) -> object:
+        method = self._reader.__arrow_c_stream__
+        return method(requested_schema) if requested_schema is not None else method()
+
+    def read_all(self) -> pa.Table:
+        return self._reader.read_all()
+
+    def read_next_batch(self) -> pa.RecordBatch:
+        return self._reader.read_next_batch()
+
+    def read_pandas(self, **kwargs: Any) -> Any:
+        return self._reader.read_pandas(**kwargs)
+
+    def cast(self, target_schema: pa.Schema) -> pa.RecordBatchReader:
+        return self._reader.cast(target_schema)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        object.__setattr__(self, "_closed", True)
+        try:
+            self._reader.close()
+        finally:
+            close = getattr(self._batches, "close", None)
+            if close is not None:
+                close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 def _read_all_delete_files(io: FileIO, tasks: Iterable[FileScanTask]) -> Dict[str, List[ChunkedArray]]:
@@ -1596,6 +1755,7 @@ class ArrowScan:
     _case_sensitive: bool
     _limit: Optional[int]
     _downcast_ns_timestamp_to_us: Optional[bool]
+    _equality_delete_budget: int
     """Scan the Iceberg Table and create an Arrow construct.
 
     Attributes:
@@ -1605,6 +1765,7 @@ class ArrowScan:
         _bound_row_filter: Schema bound row expression to filter the data with
         _case_sensitive: Case sensitivity when looking up column names
         _limit: Limit the number of records.
+        _equality_delete_budget: Maximum bytes of equality delete state for this scan.
     """
 
     def __init__(
@@ -1615,6 +1776,7 @@ class ArrowScan:
         row_filter: BooleanExpression,
         case_sensitive: bool = True,
         limit: Optional[int] = None,
+        equality_delete_budget: Optional[int] = None,
     ) -> None:
         self._table_metadata = table_metadata
         self._io = io
@@ -1623,6 +1785,11 @@ class ArrowScan:
         self._case_sensitive = case_sensitive
         self._limit = limit
         self._downcast_ns_timestamp_to_us = Config().get_bool(DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE)
+        self._equality_delete_budget = (
+            equality_delete_budget if equality_delete_budget is not None else DEFAULT_EQUALITY_DELETE_MEMORY_BUDGET
+        )
+        # Populated while an equality-delete read is in progress, for observability.
+        self.last_equality_delete_stats: Optional[Dict[str, int]] = None
 
     @property
     def _projected_field_ids(self) -> Set[int]:
@@ -1654,16 +1821,22 @@ class ArrowScan:
 
         batches = self.to_record_batches(tasks)
         try:
-            first_batch = next(batches)
-        except StopIteration:
-            # Empty
-            return arrow_schema.empty_table()
+            try:
+                first_batch = next(batches)
+            except StopIteration:
+                # Empty
+                return arrow_schema.empty_table()
 
-        # Note: cannot use pa.Table.from_batches(itertools.chain([first_batch], batches)))
-        #       as different batches can use different schema's (due to large_ types)
-        result = pa.concat_tables(
-            (pa.Table.from_batches([batch]) for batch in itertools.chain([first_batch], batches)), promote_options="permissive"
-        )
+            # Note: cannot use pa.Table.from_batches(itertools.chain([first_batch], batches)))
+            #       as different batches can use different schema's (due to large_ types)
+            result = pa.concat_tables(
+                (pa.Table.from_batches([batch]) for batch in itertools.chain([first_batch], batches)),
+                promote_options="permissive",
+            )
+        finally:
+            # Closing the generator releases equality-delete key stores and any
+            # temporary spill files, including on error or early exit.
+            batches.close()
 
         if property_as_bool(self._io.properties, PYARROW_USE_LARGE_TYPES_ON_READ, False):
             deprecation_message(
@@ -1675,7 +1848,7 @@ class ArrowScan:
 
         return result
 
-    def to_record_batches(self, tasks: Iterable[FileScanTask]) -> Iterator[pa.RecordBatch]:
+    def to_record_batches(self, tasks: Iterable[FileScanTask]) -> Generator[pa.RecordBatch, None, None]:
         """Scan the Iceberg table and return an Iterator[pa.RecordBatch].
 
         Returns an Iterator of pa.RecordBatch with data from the Iceberg table
@@ -1693,36 +1866,49 @@ class ArrowScan:
             ResolveError: When a required field cannot be found in the file
             ValueError: When a field type in the file cannot be projected to the schema type
         """
-        deletes_per_file = _read_all_delete_files(self._io, tasks)
+        return self._record_batches(tasks)
 
-        total_row_count = 0
-        executor = ExecutorFactory.get_or_create()
+    def _record_batches(self, tasks: Iterable[FileScanTask]) -> Generator[pa.RecordBatch, None, None]:
+        task_list = list(tasks)
+        deletes_per_file = _read_all_delete_files(self._io, task_list)
 
-        def batches_for_task(task: FileScanTask) -> List[pa.RecordBatch]:
-            # Materialize the iterator here to ensure execution happens within the executor.
-            # Otherwise, the iterator would be lazily consumed later (in the main thread),
-            # defeating the purpose of using executor.map.
-            return list(self._record_batches_from_scan_tasks_and_deletes([task], deletes_per_file))
+        equality_context = _new_equality_delete_context(task_list, self._equality_delete_budget)
+        try:
+            total_row_count = 0
+            executor = ExecutorFactory.get_or_create()
 
-        limit_reached = False
-        for batches in executor.map(batches_for_task, tasks):
-            for batch in batches:
-                current_batch_size = len(batch)
-                if self._limit is not None and total_row_count + current_batch_size >= self._limit:
-                    yield batch.slice(0, self._limit - total_row_count)
+            def batches_for_task(task: FileScanTask) -> List[pa.RecordBatch]:
+                # Materialize the iterator here to ensure execution happens within the executor.
+                # Otherwise, the iterator would be lazily consumed later (in the main thread),
+                # defeating the purpose of using executor.map.
+                return list(self._record_batches_from_scan_tasks_and_deletes([task], deletes_per_file, equality_context))
 
-                    limit_reached = True
+            limit_reached = False
+            for batches in executor.map(batches_for_task, task_list):
+                for batch in batches:
+                    current_batch_size = len(batch)
+                    if self._limit is not None and total_row_count + current_batch_size >= self._limit:
+                        yield batch.slice(0, self._limit - total_row_count)
+
+                        limit_reached = True
+                        break
+                    else:
+                        yield batch
+                        total_row_count += current_batch_size
+
+                if limit_reached:
+                    # This break will also cancel all running tasks in the executor
                     break
-                else:
-                    yield batch
-                    total_row_count += current_batch_size
-
-            if limit_reached:
-                # This break will also cancel all running tasks in the executor
-                break
+        finally:
+            if equality_context is not None:
+                self.last_equality_delete_stats = equality_context.stats.as_dict()
+                equality_context.close()
 
     def _record_batches_from_scan_tasks_and_deletes(
-        self, tasks: Iterable[FileScanTask], deletes_per_file: Dict[str, List[ChunkedArray]]
+        self,
+        tasks: Iterable[FileScanTask],
+        deletes_per_file: Dict[str, List[ChunkedArray]],
+        equality_context: Optional["EqualityDeleteContext"] = None,
     ) -> Iterator[pa.RecordBatch]:
         total_row_count = 0
         for task in tasks:
@@ -1740,6 +1926,7 @@ class ArrowScan:
                 self._table_metadata.specs().get(task.file.spec_id),
                 self._table_metadata.format_version,
                 self._downcast_ns_timestamp_to_us,
+                delete_context=equality_context,
             )
             for batch in batches:
                 if self._limit is not None:

@@ -44,6 +44,13 @@ from pydantic import Field
 from sortedcontainers import SortedList
 
 import pyiceberg.expressions.parser as parser
+from pyiceberg.equality_deletes import (
+    EqualityDeleteFile,
+    equality_deletes_for_data_file,
+    equality_key_types,
+    parse_equality_delete_memory_budget,
+    validate_equality_delete_file,
+)
 from pyiceberg.expressions import (
     AlwaysFalse,
     AlwaysTrue,
@@ -1755,6 +1762,7 @@ class FileScanTask(ScanTask):
 
     file: DataFile
     delete_files: Set[DataFile]
+    equality_delete_files: Tuple[EqualityDeleteFile, ...]
     start: int
     length: int
     residual: BooleanExpression
@@ -1766,12 +1774,18 @@ class FileScanTask(ScanTask):
         start: Optional[int] = None,
         length: Optional[int] = None,
         residual: BooleanExpression = ALWAYS_TRUE,
+        equality_delete_files: Optional[Iterable[EqualityDeleteFile]] = None,
     ) -> None:
         self.file = data_file
         self.delete_files = delete_files or set()
+        self.equality_delete_files = tuple(equality_delete_files or ())
         self.start = start or 0
         self.length = length or data_file.file_size_in_bytes
         self.residual = residual
+
+    def has_deletes(self) -> bool:
+        """Return whether any delete file (position or equality) applies to this task."""
+        return len(self.delete_files) > 0 or len(self.equality_delete_files) > 0
 
 
 def _open_manifest(
@@ -1911,6 +1925,9 @@ class DataScan(TableScan):
         if not snapshot:
             return iter([])
 
+        # Validate scan options eagerly, before any file (data or delete) is opened.
+        parse_equality_delete_memory_budget(self.options)
+
         # step 1: filter manifests using partition summaries
         # the filter depends on the partition spec used to write the manifest file, so create a cache of filters for each spec id
 
@@ -1933,6 +1950,10 @@ class DataScan(TableScan):
 
         data_entries: List[ManifestEntry] = []
         positional_delete_entries = SortedList(key=lambda entry: entry.sequence_number or INITIAL_SEQUENCE_NUMBER)
+        equality_delete_entries: List[Tuple[DataFile, int, bool, Tuple[str, ...]]] = []
+
+        schemas = self.table_metadata.schemas
+        spec_ids = list(self.table_metadata.specs())
 
         executor = ExecutorFactory.get_or_create()
         for manifest_entry in chain(
@@ -1956,23 +1977,41 @@ class DataScan(TableScan):
             elif data_file.content == DataFileContent.POSITION_DELETES:
                 positional_delete_entries.add(manifest_entry)
             elif data_file.content == DataFileContent.EQUALITY_DELETES:
-                raise ValueError("PyIceberg does not yet support equality deletes: https://github.com/apache/iceberg/issues/6568")
+                validate_equality_delete_file(data_file, schemas, spec_ids)
+                key_types = equality_key_types(schemas, data_file.equality_ids or [], data_file.file_path)
+                # The data sequence number is what the strict "<" rule compares;
+                # for V2 entries it has already been inherited from the manifest.
+                delete_sequence_number = (
+                    manifest_entry.sequence_number if manifest_entry.sequence_number is not None else INITIAL_SEQUENCE_NUMBER
+                )
+                spec = self.table_metadata.specs()[data_file.spec_id]
+                equality_delete_entries.append((data_file, delete_sequence_number, len(spec.fields) == 0, key_types))
             else:
                 raise ValueError(f"Unknown DataFileContent ({data_file.content}): {manifest_entry}")
 
-        return [
-            FileScanTask(
-                data_entry.data_file,
-                delete_files=_match_deletes_to_data_file(
-                    data_entry,
-                    positional_delete_entries,
-                ),
-                residual=residual_evaluators[data_entry.data_file.spec_id](data_entry.data_file).residual_for(
-                    data_entry.data_file.partition
-                ),
+        tasks: List[FileScanTask] = []
+        for data_entry in data_entries:
+            data_sequence_number = (
+                data_entry.sequence_number if data_entry.sequence_number is not None else INITIAL_SEQUENCE_NUMBER
             )
-            for data_entry in data_entries
-        ]
+            tasks.append(
+                FileScanTask(
+                    data_entry.data_file,
+                    delete_files=_match_deletes_to_data_file(
+                        data_entry,
+                        positional_delete_entries,
+                    ),
+                    residual=residual_evaluators[data_entry.data_file.spec_id](data_entry.data_file).residual_for(
+                        data_entry.data_file.partition
+                    ),
+                    equality_delete_files=equality_deletes_for_data_file(
+                        data_entry.data_file,
+                        data_sequence_number,
+                        equality_delete_entries,
+                    ),
+                )
+            )
+        return tasks
 
     def to_arrow(self) -> pa.Table:
         """Read an Arrow table eagerly from this DataScan.
@@ -1985,7 +2024,13 @@ class DataScan(TableScan):
         from pyiceberg.io.pyarrow import ArrowScan
 
         return ArrowScan(
-            self.table_metadata, self.io, self.projection(), self.row_filter, self.case_sensitive, self.limit
+            self.table_metadata,
+            self.io,
+            self.projection(),
+            self.row_filter,
+            self.case_sensitive,
+            self.limit,
+            equality_delete_budget=parse_equality_delete_memory_budget(self.options),
         ).to_table(self.plan_files())
 
     def to_arrow_batch_reader(self) -> pa.RecordBatchReader:
@@ -2001,17 +2046,23 @@ class DataScan(TableScan):
         """
         import pyarrow as pa
 
-        from pyiceberg.io.pyarrow import ArrowScan, schema_to_pyarrow
+        from pyiceberg.io.pyarrow import ArrowScan, _ClosingRecordBatchReader, schema_to_pyarrow
 
         target_schema = schema_to_pyarrow(self.projection())
         batches = ArrowScan(
-            self.table_metadata, self.io, self.projection(), self.row_filter, self.case_sensitive, self.limit
+            self.table_metadata,
+            self.io,
+            self.projection(),
+            self.row_filter,
+            self.case_sensitive,
+            self.limit,
+            equality_delete_budget=parse_equality_delete_memory_budget(self.options),
         ).to_record_batches(self.plan_files())
 
-        return pa.RecordBatchReader.from_batches(
-            target_schema,
-            batches,
-        ).cast(target_schema)
+        reader = pa.RecordBatchReader.from_batches(target_schema, batches).cast(target_schema)
+        # Wrap so that an early reader.close() also closes the scan generator,
+        # releasing equality-delete key stores and temporary spill files.
+        return _ClosingRecordBatchReader(reader, batches)
 
     def to_pandas(self, **kwargs: Any) -> pd.DataFrame:
         """Read a Pandas DataFrame eagerly from this Iceberg table.
@@ -2064,25 +2115,31 @@ class DataScan(TableScan):
         # Usage: Calculates the total number of records in a Scan that haven't had positional deletes.
         res = 0
         # every task is a FileScanTask
-        tasks = self.plan_files()
+        tasks = list(self.plan_files())
+        budget = parse_equality_delete_memory_budget(self.options)
 
-        for task in tasks:
-            # task.residual is a Boolean Expression if the filter condition is fully satisfied by the
-            # partition value and task.delete_files represents that positional delete haven't been merged yet
-            # hence those files have to read as a pyarrow table applying the filter and deletes
-            if task.residual == AlwaysTrue() and len(task.delete_files) == 0:
-                # Every File has a metadata stat that stores the file record count
-                res += task.file.record_count
-            else:
-                arrow_scan = ArrowScan(
-                    table_metadata=self.table_metadata,
-                    io=self.io,
-                    projected_schema=self.projection(),
-                    row_filter=self.row_filter,
-                    case_sensitive=self.case_sensitive,
-                )
-                tbl = arrow_scan.to_table([task])
-                res += len(tbl)
+        # Files with no deletes and a fully satisfied filter contribute their
+        # metadata record count (the shortcut) -- but only when there are no
+        # equality deletes involved, since row *values* (not metadata) decide
+        # those, and those files must be read.
+        needs_read = [task for task in tasks if task.residual != AlwaysTrue() or task.has_deletes()]
+        needs_read_ids = {id(task) for task in needs_read}
+        metered = [task for task in tasks if id(task) not in needs_read_ids]
+        res += sum(task.file.record_count for task in metered)
+
+        if needs_read:
+            # Read all deletes-bearing / filtered files in one scan so they share
+            # one equality-delete budget and one set of key stores, exactly like
+            # to_arrow.  This makes count() observe the same deletion facts.
+            arrow_scan = ArrowScan(
+                table_metadata=self.table_metadata,
+                io=self.io,
+                projected_schema=self.projection(),
+                row_filter=self.row_filter,
+                case_sensitive=self.case_sensitive,
+                equality_delete_budget=budget,
+            )
+            res += len(arrow_scan.to_table(needs_read))
         return res
 
 
